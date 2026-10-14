@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run AeroWatch locally with live traffic.
+"""Run AeroWatch locally with live traffic and METARs.
 
-Browsers won't let a web page call the OpenSky API directly (no CORS headers),
-so this serves the app on localhost and forwards /opensky/states/all to OpenSky
-from Python instead. Standard library only.
+Browsers won't let a web page call the OpenSky or aviationweather.gov APIs
+directly (no CORS headers), so this serves the app on localhost and makes those
+requests from Python instead. Standard library only.
 
     python3 serve.py          # http://localhost:8000
     python3 serve.py 8080     # pick a different port
@@ -16,14 +16,17 @@ import urllib.error
 import urllib.request
 
 OPENSKY = "https://opensky-network.org/api/"
+AWC = "https://aviationweather.gov/api/data/"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
-        # Only forward the one endpoint the app uses, so this isn't an open proxy.
+        # Only forward the two endpoints the app uses, so this isn't an open proxy.
         if self.path.startswith("/opensky/states/all"):
             self.forward(OPENSKY + self.path[len("/opensky/"):])
+        elif self.path.startswith("/awc/metar?"):
+            self.forward(AWC + self.path[len("/awc/"):])
         else:
             super().do_GET()
 

@@ -36,6 +36,11 @@
     background: var(--panel); border: 1px solid #4a3c14; color: #f3d18b; border-radius: 8px;
     padding: 8px 12px; font-size: 13px; display: none; }
   .note code { color: #fff; }
+  .note-row { display: flex; gap: 10px; align-items: flex-start; }
+  .note-row + .note-row { margin-top: 6px; }
+  .note-x { margin-left: auto; background: none; border: 0; color: inherit; font-size: 18px; line-height: 1;
+    padding: 0 2px; cursor: pointer; opacity: .8; }
+  .note-x:hover { opacity: 1; }
   .disclaimer { position: absolute; left: 10px; bottom: 8px; z-index: 1000; font-size: 11px; color: var(--muted);
     background: var(--panel); padding: 2px 8px; border-radius: 6px; }
 
@@ -80,6 +85,9 @@
 const LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 const OPENSKY = LOCAL ? '/opensky/' : 'https://opensky-network.org/api/';
 const NWS = 'https://api.weather.gov/';
+// aviationweather.gov has the raw METAR for every airport, but it blocks other websites too,
+// so only the local server can ask it. The live page uses whatever METAR text NWS has.
+const AWC = LOCAL ? '/awc/' : null;
 
 const TRAFFIC_EVERY_MS = 30 * 1000;       // anonymous OpenSky users get a daily credit limit
 const WEATHER_EVERY_MS = 10 * 60 * 1000;  // METARs only change about once an hour
@@ -152,8 +160,9 @@ map.attributionControl.addAttribution(
 map.on('baselayerchange', e => store.set('base', e.name));
 map.on('overlayadd overlayremove', e => {
   store.set('overlays', Object.keys(overlays).filter(n => map.hasLayer(overlays[n])));
-  if (e.type === 'overlayadd' && e.layer === trafficLayer) scheduleTraffic(100);
-  if (e.type === 'overlayadd' && e.layer === weatherLayer) scheduleWeather(100);
+  // loading a layer that was just turned off only updates its chip and note
+  if (e.layer === trafficLayer) scheduleTraffic(e.type === 'overlayadd' ? 100 : 0);
+  if (e.layer === weatherLayer) scheduleWeather(e.type === 'overlayadd' ? 100 : 0);
 });
 map.on('moveend', () => {
   const c = map.getCenter();
@@ -201,13 +210,24 @@ function setChip(id, label, value) {
 }
 
 const notes = {};
-function showNote(key, html) { notes[key] = html; renderNotes(); }
+const dismissed = new Set();  // notes closed with the x stay closed until the page is reloaded
+function showNote(key, html) {
+  if (dismissed.has(key)) return;
+  notes[key] = html;
+  renderNotes();
+}
 function hideNote(key) { delete notes[key]; renderNotes(); }
 function renderNotes() {
-  const all = Object.values(notes);
-  $('note').innerHTML = all.join('<br>');
-  $('note').style.display = all.length ? 'block' : 'none';
+  const keys = Object.keys(notes);
+  $('note').innerHTML = keys.map(k =>
+    `<div class="note-row"><span>${notes[k]}</span>` +
+    `<button class="note-x" data-note="${k}" title="Hide" aria-label="Hide">&times;</button></div>`).join('');
+  $('note').style.display = keys.length ? 'block' : 'none';
 }
+$('note').addEventListener('click', e => {
+  const key = e.target.dataset.note;
+  if (key) { dismissed.add(key); hideNote(key); }
+});
 
 // run fn over items with at most `limit` requests in flight
 async function mapLimit(items, limit, fn) {
@@ -318,10 +338,16 @@ function clearPlanes() {
   planes.clear();
 }
 
+function showTrafficBlocked() {
+  setChip('trafficChip', 'Traffic', 'blocked');
+  showNote('traffic', 'Live traffic doesn&rsquo;t work on this page because OpenSky blocks requests from other websites. ' +
+    'Download the repo and run <code>python3 serve.py</code> to see traffic.');
+}
+
 async function loadTraffic() {
   clearTimeout(trafficTimer);
-  if (!map.hasLayer(trafficLayer)) { setChip('trafficChip', 'Traffic', 'off'); return; }
-  if (trafficBlocked) return;
+  if (!map.hasLayer(trafficLayer)) { setChip('trafficChip', 'Traffic', 'off'); hideNote('traffic'); return; }
+  if (trafficBlocked) { showTrafficBlocked(); return; }
   if (document.hidden) { trafficTimer = setTimeout(loadTraffic, TRAFFIC_EVERY_MS); return; }
 
   const b = map.getBounds();
@@ -350,9 +376,7 @@ async function loadTraffic() {
       // No point retrying every 30 seconds, so stop until the page is reloaded.
       trafficBlocked = true;
       clearPlanes();
-      setChip('trafficChip', 'Traffic', 'blocked');
-      showNote('traffic', 'Live traffic doesn&rsquo;t work on this page because OpenSky blocks requests from other websites. ' +
-        'Download the repo and run <code>python3 serve.py</code> to see traffic.');
+      showTrafficBlocked();
       return;
     }
     setChip('trafficChip', 'Traffic', err.message === 'rate limited' ? 'rate limited, retrying' : 'error, retrying');
@@ -413,15 +437,25 @@ function readObservation(o) {
   };
 }
 
-// The "latest" observation is usually a 5-minute ASOS reading with no METAR text,
-// so when a popup opens, look back through the last few for the most recent real METAR.
+// The "latest" NWS observation is usually a 5-minute ASOS reading with no METAR text,
+// so the METAR gets looked up separately when a popup opens.
 const metarCache = new Map();  // station id -> { raw, at }
 async function latestMetar(id) {
   const hit = metarCache.get(id);
   if (hit && Date.now() - hit.at < WEATHER_EVERY_MS) return hit.raw;
-  const data = await nws(`stations/${id}/observations?limit=15`);
-  const found = (data.features || []).find(f => f.properties.rawMessage);
-  const raw = found ? found.properties.rawMessage : '';
+  let raw = '';
+  if (AWC) {
+    try {
+      const res = await fetch(`${AWC}metar?ids=${encodeURIComponent(id)}&format=raw`);
+      if (res.ok) raw = (await res.text()).trim().split('\n')[0];
+    } catch (e) { /* try NWS below */ }
+  }
+  if (!raw) {
+    // NWS only fills in the METAR text for some stations, so look back through the last few readings
+    const data = await nws(`stations/${id}/observations?limit=15`);
+    const found = (data.features || []).find(f => f.properties.rawMessage);
+    raw = found ? found.properties.rawMessage : '';
+  }
   metarCache.set(id, { raw, at: Date.now() });
   return raw;
 }
