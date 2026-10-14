@@ -1,0 +1,574 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AeroWatch</title>
+<meta name="description" content="Live traffic, METARs and VFR sectionals on one map.">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: rgba(15, 20, 25, 0.92);
+    --line: #2b333b;
+    --text: #e6e9ec;
+    --muted: #8b949e;
+    --accent: #4fc3f7;
+  }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #map { position: absolute; inset: 0; background: var(--bg); }
+
+  .bar { position: absolute; top: 10px; left: 10px; right: 60px; z-index: 1000;
+    display: flex; gap: 6px; align-items: center; flex-wrap: wrap; pointer-events: none; }
+  .bar > * { pointer-events: auto; }
+  .brand { background: var(--panel); padding: 6px 10px; border-radius: 8px; font-weight: 700; letter-spacing: .4px; }
+  .chip { background: var(--panel); padding: 6px 10px; border-radius: 8px; color: var(--muted); font-size: 12px; }
+  .chip b { color: var(--text); font-weight: 600; }
+  .btn { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 8px;
+    padding: 6px 10px; font: inherit; font-size: 13px; cursor: pointer; }
+  .btn:hover { border-color: var(--accent); }
+
+  .note { position: absolute; left: 10px; right: 10px; bottom: 34px; z-index: 1000; margin: 0 auto; max-width: 560px;
+    background: var(--panel); border: 1px solid #4a3c14; color: #f3d18b; border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; display: none; }
+  .note code { color: #fff; }
+  .disclaimer { position: absolute; left: 10px; bottom: 8px; z-index: 1000; font-size: 11px; color: var(--muted);
+    background: var(--panel); padding: 2px 8px; border-radius: 6px; }
+
+  .legend { background: var(--panel); color: var(--text); padding: 6px 9px; border-radius: 8px;
+    font-size: 12px; line-height: 1.7; margin-bottom: 26px !important; }
+  .legend .row { white-space: nowrap; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin: 0 4px 0 8px; vertical-align: -1px; }
+  .dot:first-of-type { margin-left: 0; }
+
+  .plane svg { display: block; filter: drop-shadow(0 0 1px #000); }
+  .plane.emergency svg { animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { to { opacity: .25; } }
+
+  .leaflet-popup-content { margin: 10px 12px; font-size: 13px; line-height: 1.5; }
+  .popup pre { white-space: pre-wrap; font: 12px/1.35 ui-monospace, Menlo, Consolas, monospace;
+    margin: 6px 0; padding: 6px; background: #f3f5f7; border-radius: 4px; }
+  .popup .sub { color: #66707a; }
+  .tag { display: inline-block; padding: 0 6px; border-radius: 4px; font-size: 11px; font-weight: 700;
+    color: #fff; vertical-align: 1px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+
+<div class="bar">
+  <span class="brand">AeroWatch</span>
+  <span class="chip" id="trafficChip">Traffic: <b>–</b></span>
+  <span class="chip" id="wxChip">Weather: <b>–</b></span>
+  <button class="btn" id="locateBtn" title="Center the map on my position">Locate me</button>
+  <button class="btn" id="refreshBtn" title="Reload traffic and weather now">Refresh</button>
+</div>
+<div class="note" id="note"></div>
+<div class="disclaimer">Not for navigation. Data can be late or missing.</div>
+
+<script>
+'use strict';
+
+// ---------- settings ----------
+
+// When this runs from serve.py on localhost, traffic goes through the local proxy,
+// because OpenSky doesn't allow browser requests from other websites (CORS).
+const LOCAL = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+const OPENSKY = LOCAL ? '/opensky/' : 'https://opensky-network.org/api/';
+const NWS = 'https://api.weather.gov/';
+
+const TRAFFIC_EVERY_MS = 30 * 1000;       // anonymous OpenSky users get a daily credit limit
+const WEATHER_EVERY_MS = 10 * 60 * 1000;  // METARs only change about once an hour
+const MAX_TRAFFIC_AREA = 25;              // square degrees, bigger boxes cost more OpenSky credits
+const MAX_STATIONS = 20;
+
+const M_TO_FT = 3.28084;
+const MS_TO_KT = 1.943844;
+const MS_TO_FPM = 196.8504;
+
+// localStorage can be missing or throw (private windows, blocked storage), so wrap it
+const store = {
+  get(key, fallback) {
+    try {
+      const v = localStorage.getItem('aerowatch.' + key);
+      return v === null ? fallback : JSON.parse(v);
+    } catch (e) { return fallback; }
+  },
+  set(key, value) {
+    try { localStorage.setItem('aerowatch.' + key, JSON.stringify(value)); } catch (e) { /* ignore */ }
+  }
+};
+
+// ---------- map ----------
+
+const start = store.get('view', { lat: 45.59, lng: -122.6, zoom: 9 });  // default: Portland area
+const map = L.map('map', { zoomControl: false, worldCopyJump: true })
+  .setView([start.lat, start.lng], start.zoom);
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+const baseLayers = {
+  'Dark': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19, maxNativeZoom: 16,
+    attribution: 'Tiles &copy; Esri'
+  }),
+  'Satellite': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+    maxZoom: 19,
+    attribution: 'Imagery &copy; Esri, Maxar, Earthstar Geographics'
+  }),
+  'Streets': L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  })
+};
+
+// FAA publishes the VFR sectionals as map tiles. They only exist for zoom 8-12,
+// so the layer hides when you zoom out and stretches the z12 tiles when you zoom in.
+const sectional = L.tileLayer(
+  'https://tiles.arcgis.com/tiles/ssFJjBXIUyZDrSYZ/arcgis/rest/services/VFR_Sectional/MapServer/tile/{z}/{y}/{x}', {
+    minZoom: 8, maxNativeZoom: 12, maxZoom: 19, opacity: 0.85,
+    attribution: 'Sectionals: FAA'
+  });
+
+const trafficLayer = L.layerGroup();
+const weatherLayer = L.layerGroup();
+const overlays = {
+  'VFR sectional (FAA)': sectional,
+  'Traffic (OpenSky)': trafficLayer,
+  'Weather (METARs)': weatherLayer
+};
+
+(baseLayers[store.get('base', 'Dark')] || baseLayers.Dark).addTo(map);
+for (const name of store.get('overlays', ['Traffic (OpenSky)', 'Weather (METARs)'])) {
+  if (overlays[name]) overlays[name].addTo(map);
+}
+L.control.layers(baseLayers, overlays, { position: 'topright' }).addTo(map);
+map.attributionControl.addAttribution(
+  'Traffic: <a href="https://opensky-network.org">The OpenSky Network</a> &middot; Weather: <a href="https://www.weather.gov">NWS</a>');
+
+map.on('baselayerchange', e => store.set('base', e.name));
+map.on('overlayadd overlayremove', e => {
+  store.set('overlays', Object.keys(overlays).filter(n => map.hasLayer(overlays[n])));
+  if (e.type === 'overlayadd' && e.layer === trafficLayer) scheduleTraffic(100);
+  if (e.type === 'overlayadd' && e.layer === weatherLayer) scheduleWeather(100);
+});
+map.on('moveend', () => {
+  const c = map.getCenter();
+  store.set('view', { lat: +c.lat.toFixed(4), lng: +c.lng.toFixed(4), zoom: map.getZoom() });
+  scheduleTraffic(700);
+  scheduleWeather(900);
+});
+
+// legend
+const legend = L.control({ position: 'bottomleft' });
+legend.onAdd = () => {
+  const div = L.DomUtil.create('div', 'legend');
+  div.innerHTML =
+    '<div class="row">' + ['VFR', 'MVFR', 'IFR', 'LIFR'].map(c =>
+      `<span class="dot" style="background:${CATEGORY_COLORS[c]}"></span>${c}`).join('') + '</div>' +
+    '<div class="row">' + [['#9aa4ad', 'gnd'], ['#2ecc71', '<3k'], ['#f1c40f', '<10k'], ['#ff8c42', '<18k'], ['#b388ff', 'FL180+']]
+      .map(([col, label]) => `<span class="dot" style="background:${col}"></span>${label}`).join('') + '</div>';
+  return div;
+};
+
+// ---------- little helpers ----------
+
+const $ = id => document.getElementById(id);
+
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function fmt(v, digits = 0) {
+  return v == null || Number.isNaN(v) ? '–' : Number(v).toFixed(digits);
+}
+
+// accepts epoch seconds, epoch milliseconds or an ISO string
+function ago(t) {
+  const ms = typeof t === 'number' ? (t < 1e12 ? t * 1000 : t) : Date.parse(t);
+  if (!ms) return 'unknown';
+  const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (s < 60) return s + ' s ago';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  return Math.round(s / 3600) + ' h ago';
+}
+
+function setChip(id, label, value) {
+  $(id).innerHTML = `${label}: <b>${esc(value)}</b>`;
+}
+
+const notes = {};
+function showNote(key, html) { notes[key] = html; renderNotes(); }
+function hideNote(key) { delete notes[key]; renderNotes(); }
+function renderNotes() {
+  const all = Object.values(notes);
+  $('note').innerHTML = all.join('<br>');
+  $('note').style.display = all.length ? 'block' : 'none';
+}
+
+// run fn over items with at most `limit` requests in flight
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+
+// ---------- traffic (OpenSky) ----------
+
+const planes = new Map();  // icao24 -> marker
+let trafficTimer = null;
+let trafficBlocked = false;
+
+function scheduleTraffic(delay) {
+  clearTimeout(trafficTimer);
+  trafficTimer = setTimeout(loadTraffic, delay);
+}
+
+function altitudeColor(ft, onGround) {
+  if (onGround) return '#9aa4ad';
+  if (ft == null) return '#cfd6dc';
+  if (ft < 3000) return '#2ecc71';
+  if (ft < 10000) return '#f1c40f';
+  if (ft < 18000) return '#ff8c42';
+  return '#b388ff';
+}
+
+function planeIcon(track, color, emergency) {
+  const size = 26;
+  const svg =
+    `<svg width="${size}" height="${size}" viewBox="0 0 24 24" style="transform:rotate(${Math.round(track || 0)}deg)">` +
+    `<path fill="${color}" stroke="#0b0f13" stroke-width="0.8" stroke-linejoin="round" d="M12 1.5c.7 0 1.1.6 1.1 1.4V9l8.4 4.8v2.1l-8.4-2.5v5.1l2.4 1.8v1.7L12 21.2l-3.5.8v-1.7l2.4-1.8v-5.1l-8.4 2.5v-2.1L10.9 9V2.9c0-.8.4-1.4 1.1-1.4z"/>` +
+    `</svg>`;
+  return L.divIcon({
+    className: 'plane' + (emergency ? ' emergency' : ''),
+    html: svg,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+    popupAnchor: [0, -size / 2]
+  });
+}
+
+function planePopup(p) {
+  const name = p.callsign || p.icao24.toUpperCase();
+  const alt = p.onGround ? 'On the ground'
+    : `${fmt(p.altFt)} ft baro` + (p.gpsFt != null ? ` &middot; ${fmt(p.gpsFt)} ft GPS` : '');
+  const vs = p.fpm == null ? '–' : (p.fpm > 0 ? '+' : '') + fmt(p.fpm);
+  return `<div class="popup">
+    <b>${esc(name)}</b> <span class="sub">${esc(p.icao24)} &middot; ${esc(p.country)}</span><br>
+    ${alt}<br>
+    ${fmt(p.kt)} kt &middot; track ${fmt(p.track)}&deg; &middot; ${vs} fpm<br>
+    Squawk ${esc(p.squawk || '–')}${p.emergency ? ' <span class="tag" style="background:#e53935">EMERGENCY</span>' : ''}<br>
+    <span class="sub">Last seen ${ago(p.lastContact)}</span><br>
+    <a href="https://globe.adsbexchange.com/?icao=${encodeURIComponent(p.icao24)}" target="_blank" rel="noopener">Open in ADS-B Exchange</a>
+  </div>`;
+}
+
+function drawPlanes(states) {
+  const seen = new Set();
+  for (const s of states) {
+    // OpenSky state vector, see https://openskynetwork.github.io/opensky-api/rest.html
+    const [icao24, callsign, country, , lastContact, lon, lat, baroAlt, onGround, velocity, track, vertRate, , geoAlt, squawk] = s;
+    if (lat == null || lon == null) continue;
+    seen.add(icao24);
+
+    const p = {
+      icao24, country, lastContact, onGround, track, squawk,
+      callsign: (callsign || '').trim(),
+      altFt: baroAlt != null ? baroAlt * M_TO_FT : null,
+      gpsFt: geoAlt != null ? geoAlt * M_TO_FT : null,
+      kt: velocity != null ? velocity * MS_TO_KT : null,
+      fpm: vertRate != null ? vertRate * MS_TO_FPM : null,
+      emergency: ['7500', '7600', '7700'].includes(squawk)
+    };
+    const color = p.emergency ? '#ff3b3b' : altitudeColor(p.altFt ?? p.gpsFt, onGround);
+    const icon = planeIcon(track, color, p.emergency);
+
+    const label = esc(p.callsign || icao24);
+    let m = planes.get(icao24);
+    if (!m) {
+      m = L.marker([lat, lon], { icon, keyboard: false })
+        .bindPopup(planePopup(p))
+        .bindTooltip(label, { direction: 'right', offset: [10, 0] })
+        .addTo(trafficLayer);
+      planes.set(icao24, m);
+    } else {
+      m.setLatLng([lat, lon]);
+      m.setIcon(icon);
+      m.setPopupContent(planePopup(p));
+      m.setTooltipContent(label);
+    }
+  }
+  for (const [id, m] of planes) {
+    if (!seen.has(id)) { trafficLayer.removeLayer(m); planes.delete(id); }
+  }
+}
+
+function clearPlanes() {
+  trafficLayer.clearLayers();
+  planes.clear();
+}
+
+async function loadTraffic() {
+  clearTimeout(trafficTimer);
+  if (!map.hasLayer(trafficLayer)) { setChip('trafficChip', 'Traffic', 'off'); return; }
+  if (trafficBlocked) return;
+  if (document.hidden) { trafficTimer = setTimeout(loadTraffic, TRAFFIC_EVERY_MS); return; }
+
+  const b = map.getBounds();
+  const south = Math.max(b.getSouth(), -85), north = Math.min(b.getNorth(), 85);
+  const west = Math.max(b.getWest(), -180), east = Math.min(b.getEast(), 180);
+  if ((north - south) * (east - west) > MAX_TRAFFIC_AREA) {
+    clearPlanes();
+    setChip('trafficChip', 'Traffic', 'zoom in to load');
+    trafficTimer = setTimeout(loadTraffic, TRAFFIC_EVERY_MS);
+    return;
+  }
+
+  const url = `${OPENSKY}states/all?lamin=${south.toFixed(3)}&lomin=${west.toFixed(3)}&lamax=${north.toFixed(3)}&lomax=${east.toFixed(3)}`;
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (res.status === 429) throw new Error('rate limited');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const states = data.states || [];
+    drawPlanes(states);
+    setChip('trafficChip', 'Traffic', `${states.length} aircraft`);
+    hideNote('traffic');
+  } catch (err) {
+    if (err instanceof TypeError && !LOCAL) {
+      // A TypeError from fetch here means the browser refused the request (CORS).
+      // No point retrying every 30 seconds, so stop until the page is reloaded.
+      trafficBlocked = true;
+      clearPlanes();
+      setChip('trafficChip', 'Traffic', 'blocked');
+      showNote('traffic', 'Live traffic doesn&rsquo;t work on this page because OpenSky blocks requests from other websites. ' +
+        'Download the repo and run <code>python3 serve.py</code> to see traffic.');
+      return;
+    }
+    setChip('trafficChip', 'Traffic', err.message === 'rate limited' ? 'rate limited, retrying' : 'error, retrying');
+  }
+  trafficTimer = setTimeout(loadTraffic, TRAFFIC_EVERY_MS);
+}
+
+// ---------- weather (NWS station observations) ----------
+
+const CATEGORY_COLORS = { VFR: '#2ecc71', MVFR: '#3d8bfd', IFR: '#e74c3c', LIFR: '#d35bd6' };
+let weatherTimer = null;
+let stationCenter = null;
+let stations = [];
+
+function scheduleWeather(delay) {
+  clearTimeout(weatherTimer);
+  weatherTimer = setTimeout(loadWeather, delay);
+}
+
+async function nws(pathOrUrl) {
+  const res = await fetch(pathOrUrl.startsWith('http') ? pathOrUrl : NWS + pathOrUrl,
+    { headers: { Accept: 'application/geo+json' } });
+  if (!res.ok) throw new Error('NWS ' + res.status);
+  return res.json();
+}
+
+// FAA flight categories: VFR, MVFR, IFR, LIFR
+function flightCategory(ceilingFt, visSm) {
+  if (ceilingFt == null && visSm == null) return null;
+  const c = ceilingFt ?? Infinity;
+  const v = visSm ?? Infinity;
+  if (c < 500 || v < 1) return 'LIFR';
+  if (c < 1000 || v < 3) return 'IFR';
+  if (c <= 3000 || v <= 5) return 'MVFR';
+  return 'VFR';
+}
+
+function readObservation(o) {
+  const ceilingLayers = (o.cloudLayers || [])
+    .filter(l => ['BKN', 'OVC', 'VV'].includes(l.amount) && l.base && l.base.value != null);
+  const ceilingFt = ceilingLayers.length ? Math.min(...ceilingLayers.map(l => l.base.value * M_TO_FT)) : null;
+  const visSm = o.visibility && o.visibility.value != null ? o.visibility.value / 1609.344 : null;
+  const kmh = v => (v == null ? null : v / 1.852);
+  return {
+    raw: o.rawMessage || '',
+    text: o.textDescription || '',
+    time: o.timestamp,
+    ceilingFt,
+    visSm,
+    // a station with clouds reported but no ceiling layer has no ceiling, which counts as VFR on its own
+    category: flightCategory(ceilingFt ?? ((o.cloudLayers || []).length ? Infinity : null), visSm),
+    windDir: o.windDirection?.value,
+    windKt: kmh(o.windSpeed?.value),
+    gustKt: kmh(o.windGust?.value),
+    tempC: o.temperature?.value,
+    dewC: o.dewpoint?.value,
+    altimeterInHg: o.barometricPressure?.value != null ? o.barometricPressure.value * 0.000295300 : null
+  };
+}
+
+// The "latest" observation is usually a 5-minute ASOS reading with no METAR text,
+// so when a popup opens, look back through the last few for the most recent real METAR.
+const metarCache = new Map();  // station id -> { raw, at }
+async function latestMetar(id) {
+  const hit = metarCache.get(id);
+  if (hit && Date.now() - hit.at < WEATHER_EVERY_MS) return hit.raw;
+  const data = await nws(`stations/${id}/observations?limit=15`);
+  const found = (data.features || []).find(f => f.properties.rawMessage);
+  const raw = found ? found.properties.rawMessage : '';
+  metarCache.set(id, { raw, at: Date.now() });
+  return raw;
+}
+
+// NWS mixes airport stations (KPDX) with road and mesonet sensors that don't report
+// ceiling or visibility, so only keep ICAO-style airport identifiers.
+const isAirportStation = id => /^[KPT][A-Z0-9]{3}$/.test(id);
+
+function weatherPopup(id, name, w, raw) {
+  const cat = w.category ? `<span class="tag" style="background:${CATEGORY_COLORS[w.category]}">${w.category}</span>` : '';
+  let wind = 'calm';
+  if (w.windKt != null && Math.round(w.windKt) > 0) {
+    wind = (w.windDir != null ? fmt(w.windDir) + '&deg;' : 'variable') + ' at ' + fmt(w.windKt) + ' kt' +
+      (w.gustKt != null ? ', gusting ' + fmt(w.gustKt) : '');
+  } else if (w.windKt == null) {
+    wind = '–';
+  }
+  const vis = w.visSm == null ? '–' : (w.visSm >= 9.95 ? '10+' : fmt(w.visSm, w.visSm < 3 ? 2 : 0)) + ' SM';
+  const ceiling = w.ceilingFt == null ? 'none reported' : fmt(Math.round(w.ceilingFt / 100) * 100) + ' ft';
+  const metar = raw === undefined ? '<pre class="sub">looking up the last METAR…</pre>'
+    : raw ? `<pre>${esc(raw)}</pre>` : '<br>';
+  return `<div class="popup">
+    <b>${esc(id)}</b> ${cat}<br><span class="sub">${esc(name)}</span>
+    ${metar}
+    Wind ${wind} &middot; Vis ${vis}<br>
+    Ceiling ${ceiling}<br>
+    ${fmt(w.tempC)}&deg;C / dew ${fmt(w.dewC)}&deg;C &middot; altimeter ${fmt(w.altimeterInHg, 2)}<br>
+    <span class="sub">Observed ${ago(w.time)}${w.text ? ' &middot; ' + esc(w.text) : ''}</span>
+  </div>`;
+}
+
+async function loadWeather(forceStations) {
+  clearTimeout(weatherTimer);
+  if (!map.hasLayer(weatherLayer)) { setChip('wxChip', 'Weather', 'off'); return; }
+  if (map.getZoom() < 6) {
+    weatherLayer.clearLayers();
+    setChip('wxChip', 'Weather', 'zoom in to load');
+    return;
+  }
+
+  const center = map.getCenter();
+  try {
+    // only look up a new station list when the map has moved a fair distance
+    if (forceStations === true || !stationCenter || center.distanceTo(stationCenter) > 40000) {
+      setChip('wxChip', 'Weather', 'finding stations…');
+      const point = await nws(`points/${center.lat.toFixed(4)},${center.lng.toFixed(4)}`);
+      const list = await nws(point.properties.observationStations);
+      stations = (list.features || [])  // already sorted nearest first
+        .filter(f => isAirportStation(f.properties.stationIdentifier))
+        .slice(0, MAX_STATIONS);
+      stationCenter = center;
+    }
+
+    setChip('wxChip', 'Weather', 'loading…');
+    const results = await mapLimit(stations, 6, async f => {
+      try {
+        const obs = await nws(`stations/${f.properties.stationIdentifier}/observations/latest`);
+        return { f, w: readObservation(obs.properties) };
+      } catch (e) {
+        return { f, w: null };
+      }
+    });
+
+    weatherLayer.clearLayers();
+    let shown = 0;
+    for (const { f, w } of results) {
+      if (!w) continue;
+      const [lon, lat] = f.geometry.coordinates;
+      const id = f.properties.stationIdentifier;
+      const name = f.properties.name;
+      const marker = L.circleMarker([lat, lon], {
+        radius: 7, color: '#0b0f13', weight: 1.5,
+        fillColor: w.category ? CATEGORY_COLORS[w.category] : '#9aa4ad', fillOpacity: 0.95
+      })
+        .bindTooltip(id, { direction: 'top', offset: [0, -6] })
+        .bindPopup(weatherPopup(id, name, w, w.raw || undefined))
+        .addTo(weatherLayer);
+      if (!w.raw) {
+        marker.on('popupopen', () => {
+          latestMetar(id)
+            .then(raw => marker.setPopupContent(weatherPopup(id, name, w, raw)))
+            .catch(() => marker.setPopupContent(weatherPopup(id, name, w, '')));
+        });
+      }
+      shown++;
+    }
+    setChip('wxChip', 'Weather', `${shown} stations`);
+    hideNote('weather');
+  } catch (err) {
+    weatherLayer.clearLayers();
+    stationCenter = null;
+    setChip('wxChip', 'Weather', 'unavailable');
+    if (String(err.message).includes('404')) {
+      showNote('weather', 'Weather comes from the National Weather Service, so it only covers the US.');
+    }
+  }
+  weatherTimer = setTimeout(loadWeather, WEATHER_EVERY_MS);
+}
+
+// ---------- my position ----------
+
+let me = null, meAccuracy = null, watchId = null, centerOnFix = false;
+
+$('locateBtn').addEventListener('click', () => {
+  if (!navigator.geolocation) {
+    showNote('gps', 'This browser can&rsquo;t share your location.');
+    return;
+  }
+  if (me) map.setView(me.getLatLng(), Math.max(map.getZoom(), 10));
+  else centerOnFix = true;
+  if (watchId !== null) return;
+
+  watchId = navigator.geolocation.watchPosition(pos => {
+    hideNote('gps');
+    const ll = [pos.coords.latitude, pos.coords.longitude];
+    if (!me) {
+      meAccuracy = L.circle(ll, { radius: pos.coords.accuracy, color: '#4fc3f7', weight: 1, fillOpacity: 0.08 }).addTo(map);
+      me = L.circleMarker(ll, { radius: 7, color: '#fff', weight: 2, fillColor: '#2196f3', fillOpacity: 1 })
+        .bindTooltip('You').addTo(map);
+    } else {
+      me.setLatLng(ll);
+      meAccuracy.setLatLng(ll).setRadius(pos.coords.accuracy);
+    }
+    if (centerOnFix) { centerOnFix = false; map.setView(ll, Math.max(map.getZoom(), 10)); }
+  }, err => {
+    showNote('gps', 'Couldn&rsquo;t get your location: ' + esc(err.message));
+    navigator.geolocation.clearWatch(watchId);
+    watchId = null;
+  }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 20000 });
+});
+
+// ---------- go ----------
+
+$('refreshBtn').addEventListener('click', () => {
+  trafficBlocked = false;
+  hideNote('traffic');
+  loadTraffic();
+  loadWeather(true);
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) scheduleTraffic(200);
+});
+
+legend.addTo(map);
+loadTraffic();
+loadWeather(true);
+</script>
+</body>
+</html>
