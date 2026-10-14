@@ -460,6 +460,52 @@ async function latestMetar(id) {
   return raw;
 }
 
+// Read the basic groups out of a METAR, so the lines under it in the popup describe
+// the same report instead of the newer 5-minute reading.
+function parseMetar(raw) {
+  const body = ' ' + raw.split(' RMK ')[0].replace(/[=$]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+  const out = {};
+  let m;
+  if ((m = body.match(/ (\d{2})(\d{2})(\d{2})Z /))) {
+    const now = new Date();
+    out.time = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), +m[1], +m[2], +m[3]);
+    if (out.time > Date.now() + 3600e3) {  // a report from the end of last month
+      out.time = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, +m[1], +m[2], +m[3]);
+    }
+  }
+  if ((m = body.match(/ (\d{3}|VRB)(\d{2,3})(?:G(\d{2,3}))?KT /))) {
+    out.windDir = m[1] === 'VRB' ? null : +m[1];
+    out.windKt = +m[2];
+    out.gustKt = m[3] ? +m[3] : null;
+  }
+  // 10SM, 2 1/2SM, 3/4SM, M1/4SM
+  if ((m = body.match(/ M?(?:(\d+) )?(?:(\d+)\/(\d+)|(\d+))SM /))) {
+    out.visSm = m[4] ? +m[4] : (m[1] ? +m[1] : 0) + +m[2] / +m[3];
+  }
+  const layers = [...body.matchAll(/ (FEW|SCT|BKN|OVC|VV)(\d{3})/g)];
+  const ceilings = layers.filter(l => l[1] === 'BKN' || l[1] === 'OVC' || l[1] === 'VV').map(l => +l[2] * 100);
+  out.ceilingFt = ceilings.length ? Math.min(...ceilings) : null;
+  out.skyReported = layers.length > 0 || / (CLR|SKC|NSC|NCD) /.test(body);
+  if ((m = body.match(/ (M)?(\d{2})\/(?:(M)?(\d{2}))? /))) {
+    out.tempC = (m[1] ? -1 : 1) * +m[2];
+    out.dewC = m[4] ? (m[3] ? -1 : 1) * +m[4] : null;
+  }
+  if ((m = body.match(/ A(\d{4}) /))) out.altimeterInHg = +m[1] / 100;
+  return out;
+}
+
+function weatherFromMetar(raw, fallback) {
+  const p = parseMetar(raw);
+  if (p.windKt === undefined && p.visSm === undefined && p.tempC === undefined) return fallback;  // couldn't read it
+  return {
+    raw, text: '', time: p.time ?? fallback.time,
+    ceilingFt: p.ceilingFt, visSm: p.visSm ?? null,
+    category: flightCategory(p.ceilingFt ?? (p.skyReported ? Infinity : null), p.visSm ?? null),
+    windDir: p.windDir ?? null, windKt: p.windKt ?? null, gustKt: p.gustKt ?? null,
+    tempC: p.tempC ?? null, dewC: p.dewC ?? null, altimeterInHg: p.altimeterInHg ?? null
+  };
+}
+
 // NWS mixes airport stations (KPDX) with road and mesonet sensors that don't report
 // ceiling or visibility, so only keep ICAO-style airport identifiers.
 const isAirportStation = id => /^[KPT][A-Z0-9]{3}$/.test(id);
@@ -536,7 +582,7 @@ async function loadWeather(forceStations) {
       if (!w.raw) {
         marker.on('popupopen', () => {
           latestMetar(id)
-            .then(raw => marker.setPopupContent(weatherPopup(id, name, w, raw)))
+            .then(raw => marker.setPopupContent(weatherPopup(id, name, raw ? weatherFromMetar(raw, w) : w, raw)))
             .catch(() => marker.setPopupContent(weatherPopup(id, name, w, '')));
         });
       }
